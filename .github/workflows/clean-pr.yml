@@ -1,0 +1,36 @@
+name: Clean pull request text
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]   # edited: fixing the description runs the check again
+jobs:
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove PII and secrets from the pull request body
+        shell: bash                  # bash -eo pipefail: a refused or failed call fails the step
+        env:
+          GW: ${{ secrets.VRYMDOR_NODE_URL }}
+          AGENT_ID: ${{ secrets.VRYMDOR_AGENT_ID }}
+          AGENT_SECRET: ${{ secrets.VRYMDOR_AGENT_SECRET }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          TOKEN=$(jq -n --arg id "$AGENT_ID" --arg s "$AGENT_SECRET" '{agent_id:$id,agent_secret:$s}' \
+            | curl -sf -X POST "$GW/v1/token" -H 'Content-Type: application/json' -d @- | jq -r .access_token)
+          echo "::add-mask::$TOKEN"
+          RESULT=$(jq -n --arg body "$PR_BODY" '{action:{type:"sanitize"},input:$body,context:{platform:"github-actions"}}' \
+            | curl -sf -X POST "$GW/v1/node/run" -H "Authorization: Bearer $TOKEN" \
+                -H 'Content-Type: application/json' -d @-)
+          jq -r .output <<<"$RESULT" > sanitized-body.txt
+          cat sanitized-body.txt
+          # The node flags a likely prompt injection (rule injection_marker, ASI01) and still returns the
+          # cleaned text, so live traffic is never refused on a guess. A pull request is different: this fails
+          # the check so a person reviews the text first. Make the check required to stop the merge.
+          if jq -e '.rules | index("injection_marker")' <<<"$RESULT" >/dev/null; then
+            # The node names each phrase it matched (its fixed list, never other text); point at the line.
+            jq -r '.markers // [] | .[]' <<<"$RESULT" | while IFS= read -r phrase; do
+              line=$(grep -n -i -F -m1 -- "$phrase" <<<"$PR_BODY" | cut -d: -f1)
+              echo "::error title=Possible prompt injection::Found \"$phrase\" in the pull request description${line:+ on line $line}. Edit the description and this check runs again."
+            done
+            echo "::error title=Posull request description contains aknown prompt injection phrase (ASI01). Review it before merging."
+            exit 1
+          fi
